@@ -12,7 +12,10 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -73,7 +76,7 @@ import java.nio.charset.Charset
 import java.util.Locale
 import kotlin.math.*
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MapScreen() {
     val context = LocalContext.current
@@ -120,7 +123,11 @@ fun MapScreen() {
     var showSunSimulator by remember { mutableStateOf(false) }
     var sunHour by remember { mutableStateOf(12f) }
     var showInclinometer by remember { mutableStateOf(false) }
-    var showPeakFinderDialog by remember { mutableStateOf(false) }
+    var isNorthLocked by remember { mutableStateOf(false) }
+    var showArCamera by remember { mutableStateOf(false) }
+    var ultraBatteryEnabled by remember { mutableStateOf(false) }
+    var showLiveShareDialog by remember { mutableStateOf(false) }
+    var contactEmail by remember { mutableStateOf("") }
     var showSosConfirmDialog by remember { mutableStateOf(false) }
 
     // Offline & Aggiornamento dati
@@ -537,7 +544,7 @@ fun MapScreen() {
                             drawPoisOnMap(map, allLoadedPois.filter { it.category in activePoiFilters })
                             drawPeaksOnMap(map, if (is3DEnabled) allLoadedPeaks else emptyList())
                         }
-                        val targetPitch = if (is3DEnabled) 68.0 else 0.0
+                        val targetPitch = if (is3DEnabled) 78.0 else 0.0
                         val targetZoom = if (is3DEnabled && map.cameraPosition.zoom < 12.5) 13.2 else map.cameraPosition.zoom
                         map.animateCamera(
                             CameraUpdateFactory.newCameraPosition(
@@ -739,7 +746,7 @@ fun MapScreen() {
                             showToolsMenu = false
                             showInclinometer = true
                         }
-                        ToolMenuRow(Icons.Default.Terrain, "Identificatore Cime / Orizzonte", "Vette visibili nel raggio con quota e distanza") {
+                        ToolMenuRow(Icons.Default.PhotoCamera, "Riconoscimento Cime AR (Fotocamera)", "Inquadra l'orizzonte con nome e quota delle vette") {
                             showToolsMenu = false
                             mapLibreMap?.projection?.visibleRegion?.latLngBounds?.let { b ->
                                 scope.launch {
@@ -748,9 +755,30 @@ fun MapScreen() {
                                     )
                                     allLoadedPois = pois
                                     allLoadedPeaks = peaks
-                                    showPeakFinderDialog = true
                                 }
-                            } ?: run { showPeakFinderDialog = true }
+                            }
+                            showArCamera = true
+                        }
+                        ToolMenuRow(Icons.Default.ShareLocation, "Live Tracking con Email", "Condividi link posizione live (con coda offline)") {
+                            showToolsMenu = false
+                            showLiveShareDialog = true
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Ultra Risparmio Batteria", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.Black)
+                                Text("GPS ogni 12s/15m per uscite lunghe 8-9h", fontSize = 11.sp, color = Color.Gray)
+                            }
+                            Switch(
+                                checked = ultraBatteryEnabled,
+                                onCheckedChange = {
+                                    ultraBatteryEnabled = it
+                                    TrackingService.ultraBatteryMode = it
+                                }
+                            )
                         }
                         ToolMenuRow(Icons.Default.Route, "Pianifica Percorso / Importa GPX", "Traccia itinerario o apri file GPX") {
                             showToolsMenu = false
@@ -1090,6 +1118,80 @@ fun MapScreen() {
             }
         }
 
+
+        // DIALOG CONDIVISIONE LIVE TRACKING VIA EMAIL
+        if (showLiveShareDialog) {
+            val topicId = remember { "mapyoutdoor_${System.currentTimeMillis().toString().takeLast(6)}" }
+            val liveUrl = "https://ntfy.sh/$topicId"
+            AlertDialog(
+                onDismissRequest = { showLiveShareDialog = false },
+                containerColor = Color.White,
+                title = { Text("Live Tracking via Email", fontWeight = FontWeight.Bold, color = Color(0xFF1B4332)) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Inserisci l'email della persona che ti segue da casa. Durante la registrazione l'app invierà aggiornamenti periodici (accodandoli se sei offline).",
+                            fontSize = 13.sp,
+                            color = Color.DarkGray
+                        )
+                        OutlinedTextField(
+                            value = contactEmail,
+                            onValueChange = { contactEmail = it },
+                            label = { Text("Email contatto") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            TrackingService.liveTrackingTopic = topicId
+                            showLiveShareDialog = false
+                            if (!isRecording) {
+                                context.startForegroundService(Intent(context, TrackingService::class.java))
+                            }
+                            val emailIntent = Intent(Intent.ACTION_SENDTO).apply {
+                                data = Uri.parse("mailto:")
+                                putExtra(Intent.EXTRA_EMAIL, arrayOf(contactEmail))
+                                putExtra(Intent.EXTRA_SUBJECT, "Seguimi in diretta su MapyOutdoor")
+                                putExtra(Intent.EXTRA_TEXT, "Ciao, puoi seguire i miei aggiornamenti GPS in quota (coordinate, altitudine e link mappa) aprendo questa pagina dal browser:\n\n$liveUrl\n\n(Gli aggiornamenti arrivano automaticamente ogni volta che il telefono aggancia rete).")
+                            }
+                            try {
+                                context.startActivity(emailIntent)
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "Canale Live attivo: $liveUrl", Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B4332))
+                    ) {
+                        Text("Attiva e Invia Email", color = Color.White)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showLiveShareDialog = false }) { Text("Annulla", color = Color.Gray) }
+                }
+            )
+        }
+
+        // SCHERMATA FOTOCAMERA AR RICONOSCIMENTO CIME
+        if (showArCamera) {
+            val refLoc = userCurrentLatLng ?: mapLibreMap?.cameraPosition?.target ?: LatLng(45.8326, 6.8652)
+            ArPeakFinderOverlay(
+                userLatLng = refLoc,
+                compassAzimuth = compassAzimuth,
+                peaks = allLoadedPeaks,
+                onSelectPeak = { pk ->
+                    showArCamera = false
+                    val dest = LatLng(pk.lat, pk.lon)
+                    targetWaypoint = "${pk.name} (${pk.elevationMeters}m)" to dest
+                    drawTargetLine(mapLibreMap, userCurrentLatLng, dest)
+                    mapLibreMap?.animateCamera(CameraUpdateFactory.newLatLngZoom(dest, 14.5))
+                },
+                onClose = { showArCamera = false }
+            )
+        }
+
         // CONTROLLI IN BASSO (REGISTRA + POSIZIONE + PANNELLO GPX)
         if (!showWeatherSheet) {
             Column(
@@ -1098,10 +1200,83 @@ fun MapScreen() {
                     .fillMaxWidth()
                     .navigationBarsPadding()
             ) {
+                // Bussola circolare grafica in basso a sinistra (Tap = Heading-Up, Hold = Blocca Nord)
+                Box(
+                    modifier = Modifier
+                        .padding(start = 16.dp, bottom = 4.dp)
+                        .size(64.dp)
+                        .shadow(8.dp, CircleShape)
+                        .background(Color(0xFF101820).copy(alpha = 0.92f), CircleShape)
+                        .combinedClickable(
+                            onClick = {
+                                if (!isNorthLocked) {
+                                    mapLibreMap?.let { map ->
+                                        map.animateCamera(
+                                            CameraUpdateFactory.newCameraPosition(
+                                                CameraPosition.Builder()
+                                                    .target(map.cameraPosition.target)
+                                                    .zoom(map.cameraPosition.zoom)
+                                                    .tilt(map.cameraPosition.tilt)
+                                                    .bearing(compassAzimuth.toDouble())
+                                                    .build()
+                                            )
+                                        )
+                                    }
+                                    Toast.makeText(context, "Mappa orientata sulla tua direzione", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Nord bloccato (tieni premuto per sbloccare)", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onLongClick = {
+                                isNorthLocked = !isNorthLocked
+                                if (isNorthLocked) {
+                                    mapLibreMap?.let { map ->
+                                        map.animateCamera(
+                                            CameraUpdateFactory.newCameraPosition(
+                                                CameraPosition.Builder()
+                                                    .target(map.cameraPosition.target)
+                                                    .zoom(map.cameraPosition.zoom)
+                                                    .tilt(map.cameraPosition.tilt)
+                                                    .bearing(0.0)
+                                                    .build()
+                                            )
+                                        )
+                                    }
+                                    Toast.makeText(context, "NORD BLOCCATO (0°)", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Nord sbloccato", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val displayAngle = if (isNorthLocked) 0f else -compassAzimuth
+                    Box(modifier = Modifier.fillMaxSize().rotate(displayAngle), contentAlignment = Alignment.Center) {
+                        Text("N", color = Color(0xFFE63946), fontWeight = FontWeight.ExtraBold, fontSize = 11.sp, modifier = Modifier.align(Alignment.TopCenter).padding(top = 3.dp))
+                        Text("S", color = Color.LightGray, fontSize = 9.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp))
+                        Text("E", color = Color.LightGray, fontSize = 9.sp, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 4.dp))
+                        Text("O", color = Color.LightGray, fontSize = 9.sp, modifier = Modifier.align(Alignment.CenterStart).padding(start = 4.dp))
+                        Icon(
+                            Icons.Default.Navigation,
+                            contentDescription = "Ago Bussola",
+                            tint = if (isNorthLocked) Color(0xFFFFD166) else Color(0xFFE63946),
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    if (isNorthLocked) {
+                        Icon(
+                            Icons.Default.Lock,
+                            contentDescription = "Nord Bloccato",
+                            tint = Color(0xFFFFD166),
+                            modifier = Modifier.size(12.dp).align(Alignment.BottomEnd).padding(4.dp)
+                        )
+                    }
+                }
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
