@@ -621,4 +621,72 @@ object RoutingService {
         val brng = Math.toDegrees(atan2(y, x))
         return ((brng + 360.0) % 360.0).toInt()
     }
+
+
+    suspend fun fetchHorizonProfile360(
+        centerLat: Double,
+        centerLon: Double,
+        observerEleMeters: Double
+    ): FloatArray = withContext(Dispatchers.IO) {
+        val resultAngles = FloatArray(360) { 0f }
+        try {
+            // Campiona 72 direzioni (ogni 5°) su 4 anelli di distanza (5km, 15km, 35km, 65km) = 288 punti
+            val distancesKm = doubleArrayOf(5.0, 15.0, 35.0, 65.0)
+            val lats = mutableListOf<Double>()
+            val lons = mutableListOf<Double>()
+            val meta = mutableListOf<Pair<Int, Double>>() // azimuthIdx (0..71) to distMeters
+
+            val earthRadius = 6371000.0
+            for (azIdx in 0 until 72) {
+                val brng = Math.toRadians(azIdx * 5.0)
+                for (dKm in distancesKm) {
+                    val dM = dKm * 1000.0
+                    val angDist = dM / earthRadius
+                    val lat1 = Math.toRadians(centerLat)
+                    val lon1 = Math.toRadians(centerLon)
+                    val lat2 = asin(sin(lat1) * cos(angDist) + cos(lat1) * sin(angDist) * cos(brng))
+                    val lon2 = lon1 + atan2(sin(brng) * sin(angDist) * cos(lat1), cos(angDist) - sin(lat1) * sin(lat2))
+                    lats.add(Math.toDegrees(lat2))
+                    lons.add(Math.toDegrees(lon2))
+                    meta.add(azIdx to dM)
+                }
+            }
+
+            // Chiamata batch Open-Meteo Elevation API (gratuita, senza chiave)
+            val latsStr = lats.joinToString(",") { String.format(Locale.US, "%.4f", it) }
+            val lonsStr = lons.joinToString(",") { String.format(Locale.US, "%.4f", it) }
+            val url = "https://api.open-meteo.com/v1/elevation?latitude=$latsStr&longitude=$lonsStr"
+            val req = Request.Builder().url(url).build()
+
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return@withContext resultAngles
+                val json = JSONObject(body)
+                val elevArr = json.getJSONArray("elevation")
+                val coarseMaxAngles = FloatArray(72) { -15f }
+
+                for (i in 0 until minOf(elevArr.length(), meta.size)) {
+                    val terrainEle = elevArr.getDouble(i)
+                    val (azIdx, distM) = meta[i]
+                    // Correzione curvatura terrestre
+                    val curvatureDrop = (distM * distM) / (2.0 * earthRadius)
+                    val effectiveDeltaH = terrainEle - observerEleMeters - curvatureDrop
+                    val angleDeg = Math.toDegrees(atan2(effectiveDeltaH, distM)).toFloat()
+                    if (angleDeg > coarseMaxAngles[azIdx]) {
+                        coarseMaxAngles[azIdx] = angleDeg
+                    }
+                }
+
+                // Interpolazione lineare sui 360 gradi
+                for (deg in 0 until 360) {
+                    val idx0 = (deg / 5) % 72
+                    val idx1 = (idx0 + 1) % 72
+                    val frac = (deg % 5) / 5.0f
+                    resultAngles[deg] = coarseMaxAngles[idx0] * (1f - frac) + coarseMaxAngles[idx1] * frac
+                }
+            }
+        } catch (_: Exception) {
+        }
+        resultAngles
+    }
+
 }

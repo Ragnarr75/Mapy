@@ -86,6 +86,7 @@ fun MapScreen() {
     var currentLayer by remember { mutableStateOf(MapLayerType.ALPINE) }
     var showLayerMenu by remember { mutableStateOf(false) }
     var is3DEnabled by remember { mutableStateOf(false) }
+    var isFlyoverPlaying by remember { mutableStateOf(false) }
 
     // Ricerca luoghi
     var searchQuery by remember { mutableStateOf("") }
@@ -240,6 +241,42 @@ fun MapScreen() {
         delay(400)
         searchResults = RoutingService.searchPlaces(searchQuery)
         isSearching = false
+    }
+
+
+    // Animazione Sorvolo 3D in stile Relive lungo la traccia GPX attiva
+    LaunchedEffect(isFlyoverPlaying, activeTrack) {
+        val pts = activeTrack?.points ?: emptyList()
+        if (isFlyoverPlaying && pts.size >= 2) {
+            is3DEnabled = true
+            currentLayer = MapLayerType.SATELLITE
+            mapLibreMap?.let { map ->
+                applyMapStyle(map, currentLayer, true, sunHour) {
+                    drawTrackOnMap(map, pts)
+                    drawPeaksOnMap(map, allLoadedPeaks)
+                }
+            }
+            val step = maxOf(1, pts.size / 60)
+            for (i in 0 until pts.size - step step step) {
+                if (!isFlyoverPlaying) break
+                val p1 = pts[i]
+                val p2 = pts[minOf(pts.size - 1, i + step)]
+                val brg = RoutingService.calculateBearing(p1.lat, p1.lon, p2.lat, p2.lon).toDouble()
+                mapLibreMap?.animateCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder()
+                            .target(LatLng(p1.lat, p1.lon))
+                            .zoom(14.6)
+                            .tilt(76.0)
+                            .bearing(brg)
+                            .build()
+                    ),
+                    420
+                )
+                delay(430)
+            }
+            isFlyoverPlaying = false
+        }
     }
 
     LaunchedEffect(recordedPoints) {
@@ -1328,7 +1365,20 @@ fun MapScreen() {
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(track.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color.Black, modifier = Modifier.weight(1f))
+                                Text(track.name, fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.Black, modifier = Modifier.weight(1f))
+                                FilledTonalButton(
+                                    onClick = { isFlyoverPlaying = !isFlyoverPlaying },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Icon(
+                                        if (isFlyoverPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                        contentDescription = "Sorvolo 3D",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(if (isFlyoverPlaying) "Stop 3D" else "Relive 3D", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
                                 IconButton(onClick = { gpxExporter.launch("${track.name.replace(" ", "_")}.gpx") }) {
                                     Icon(Icons.Default.Share, contentDescription = "Esporta GPX", tint = Color(0xFF1B4332))
                                 }
@@ -1591,12 +1641,19 @@ private fun drawTrackOnMap(map: MapLibreMap?, points: List<TrackPoint>) {
         existingSource.setGeoJson(feature)
     } else {
         style.addSource(GeoJsonSource(sourceId, feature))
+        val outlineLayer = LineLayer("gpx-track-outline", sourceId).withProperties(
+            PropertyFactory.lineColor("#FFFFFF"),
+            PropertyFactory.lineWidth(7.5f),
+            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
+        )
         val layer = LineLayer(layerId, sourceId).withProperties(
-            PropertyFactory.lineColor("#D32F2F"),
+            PropertyFactory.lineColor("#FF3B30"),
             PropertyFactory.lineWidth(4.5f),
             PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
             PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND)
         )
+        style.addLayer(outlineLayer)
         style.addLayer(layer)
     }
 }
