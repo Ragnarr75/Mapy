@@ -40,24 +40,51 @@ data class PoiItem(
     val elevation: String = ""
 )
 
-data class AlpineWeatherReport(
-    val elevationMeters: Int,
-    val freezingLevelCurrent: Int,
-    val freezingLevelMin24h: Int,
-    val freezingLevelMax24h: Int,
-    val tempAtElevation: Double,
-    val windSpeedKmh: Double,
-    val windGustsKmh: Double,
-    val cloudCoverLow: Int,
-    val cloudCoverMid: Int,
-    val cloudCoverHigh: Int,
-    val precipitationProbMax: Int,
-    val summaryWarning: String
+data class PeakItem(
+    val name: String,
+    val lat: Double,
+    val lon: Double,
+    val elevationMeters: Int
+)
+
+data class HourlyAlpineSlot(
+    val timeLabel: String,
+    val tempAtTarget: Double,
+    val feelsLike: Double,
+    val freezingLevel: Int,
+    val windKmh: Int,
+    val gustsKmh: Int,
+    val snowLimitMeters: Int,
+    val precipMm: Double,
+    val cloudLow: Int,
+    val cloudMid: Int,
+    val cloudHigh: Int
+)
+
+data class DailyAlpineForecast(
+    val dateLabel: String,
+    val slots: List<HourlyAlpineSlot>
+)
+
+data class AvalancheBulletin(
+    val regionName: String,
+    val dangerRating: Int,
+    val dangerLabel: String,
+    val problemTitle: String,
+    val elevationThreshold: String,
+    val summaryText: String
+)
+
+data class AlpineFullWeather(
+    val baseElevation: Int,
+    val days: List<DailyAlpineForecast>,
+    val avalanche: AvalancheBulletin?,
+    val officialAlert: String?
 )
 
 enum class MapLayerType(val label: String) {
-    OUTDOOR("Escursionistica"),
-    SLOPES("Pendenze / Canali 30-45°"),
-    WINTER("Invernale"),
-    SATELLITE("Satellitare")
+    ALPINE("Alpina / Sentieri CAI"),
+    SWISSTOPO("Swisstopo (Alpi)"),
+    SLOPES("Pendenze Canali 30-45°"),
+    SATELLITE("Satellitare 3D")
 }

@@ -7,6 +7,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.net.Uri
+import android.os.BatteryManager
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,12 +20,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -53,6 +56,7 @@ import org.maplibre.android.offline.OfflineRegion
 import org.maplibre.android.offline.OfflineRegionError
 import org.maplibre.android.offline.OfflineRegionStatus
 import org.maplibre.android.offline.OfflineTilePyramidRegionDefinition
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.HillshadeLayer
 import org.maplibre.android.style.layers.LineLayer
@@ -61,6 +65,7 @@ import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.RasterDemSource
+import org.maplibre.android.style.sources.Terrain
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
@@ -76,7 +81,7 @@ fun MapScreen() {
     val scope = rememberCoroutineScope()
 
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
-    var currentLayer by remember { mutableStateOf(MapLayerType.OUTDOOR) }
+    var currentLayer by remember { mutableStateOf(MapLayerType.ALPINE) }
     var showLayerMenu by remember { mutableStateOf(false) }
     var is3DEnabled by remember { mutableStateOf(false) }
 
@@ -85,8 +90,9 @@ fun MapScreen() {
     var searchResults by remember { mutableStateOf<List<SearchPlace>>(emptyList()) }
     var isSearching by remember { mutableStateOf(false) }
 
-    // POI selezionabili + cache offline
+    // POI selezionabili + Vette 3D
     var allLoadedPois by remember { mutableStateOf<List<PoiItem>>(emptyList()) }
+    var allLoadedPeaks by remember { mutableStateOf<List<PeakItem>>(emptyList()) }
     var activePoiFilters by remember { mutableStateOf<Set<PoiCategory>>(emptySet()) }
     var isLoadingPois by remember { mutableStateOf(false) }
 
@@ -97,46 +103,96 @@ fun MapScreen() {
     var targetWaypoint by remember { mutableStateOf<Pair<String, LatLng>?>(null) }
     var userCurrentLatLng by remember { mutableStateOf<LatLng?>(null) }
 
-    // Meteo in quota + Strumenti Alpinismo
-    var selectedWeatherPoint by remember { mutableStateOf<LatLng?>(null) }
-    var weatherReport by remember { mutableStateOf<AlpineWeatherReport?>(null) }
-    var isLoadingWeather by remember { mutableStateOf(false) }
-    var showAlpineHud by remember { mutableStateOf(false) }
+    // Sensori hardware (Bussola, Barometro, Inclinometro)
     var baroAltitude by remember { mutableStateOf<Float?>(null) }
+    var compassAzimuth by remember { mutableStateOf(0f) }
+    var slopePitchDegrees by remember { mutableStateOf(0) }
 
-    // Download Offline Area
+    // Meteo Alpinistico 5 Giorni & Bollettini Valanghe
+    var showWeatherSheet by remember { mutableStateOf(false) }
+    var weatherData by remember { mutableStateOf<AlpineFullWeather?>(null) }
+    var isLoadingWeather by remember { mutableStateOf(false) }
+    var selectedDayIndex by remember { mutableStateOf(0) }
+    var selectedAltitudeOverride by remember { mutableStateOf<Int?>(null) }
+    var weatherTargetLatLng by remember { mutableStateOf<LatLng?>(null) }
+
+    // Menu Strumenti Unificato ("magro")
+    var showToolsMenu by remember { mutableStateOf(false) }
+    var showSunSimulator by remember { mutableStateOf(false) }
+    var sunHour by remember { mutableStateOf(12f) }
+    var showInclinometer by remember { mutableStateOf(false) }
+    var showPeakFinderDialog by remember { mutableStateOf(false) }
+    var showSosConfirmDialog by remember { mutableStateOf(false) }
+
+    // Offline & Aggiornamento dati
+    var showOfflineDialog by remember { mutableStateOf(false) }
     var offlineProgress by remember { mutableStateOf<Float?>(null) }
-    var showOfflineConfirm by remember { mutableStateOf(false) }
+    var savedRegions by remember { mutableStateOf<List<Pair<String, OfflineRegion>>>(emptyList()) }
 
     val isRecording by TrackingService.isRecording.collectAsState()
     val recordedPoints by TrackingService.recordedPoints.collectAsState()
 
-    // Sensore barometrico per altimetro reale S23 Ultra
+    fun refreshSavedRegions() {
+        OfflineManager.getInstance(context).listOfflineRegions(object : OfflineManager.ListOfflineRegionsCallback {
+            override fun onList(offlineRegions: Array<OfflineRegion>?) {
+                savedRegions = offlineRegions?.map { reg ->
+                    val title = try {
+                        String(reg.metadata, Charset.forName("UTF-8"))
+                    } catch (_: Exception) {
+                        "Area Offline"
+                    }
+                    title to reg
+                } ?: emptyList()
+            }
+            override fun onError(error: String) {}
+        })
+    }
+
+    // Sensori: Barometro + Bussola + Inclinometro
     DisposableEffect(Unit) {
         val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
         val pressureSensor = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
+        val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        val rotationMatrix = FloatArray(9)
+        val orientationAngles = FloatArray(3)
+
         val listener = object : SensorEventListener {
             override fun onSensorChanged(event: SensorEvent?) {
-                val hPa = event?.values?.firstOrNull() ?: return
-                baroAltitude = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hPa)
+                if (event == null) return
+                if (event.sensor.type == Sensor.TYPE_PRESSURE) {
+                    val hPa = event.values?.firstOrNull() ?: return
+                    baroAltitude = SensorManager.getAltitude(SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hPa)
+                } else if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
+                    val deg = ((Math.toDegrees(orientationAngles[0].toDouble()) + 360.0) % 360.0).toFloat()
+                    compassAzimuth = deg
+                    val pitchDeg = abs(Math.toDegrees(orientationAngles[1].toDouble())).toInt()
+                    slopePitchDegrees = minOf(90, pitchDeg)
+                }
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
         }
-        if (pressureSensor != null) {
-            sensorManager.registerListener(listener, pressureSensor, SensorManager.SENSOR_DELAY_UI)
-        }
+        pressureSensor?.let { sensorManager.registerListener(listener, it, SensorManager.SENSOR_DELAY_UI) }
+        rotationSensor?.let { sensorManager.registerListener(listener, it, SensorManager.SENSOR_DELAY_UI) }
         onDispose { sensorManager.unregisterListener(listener) }
     }
 
     LaunchedEffect(Unit) {
         OfflineManager.getInstance(context).setOfflineMapboxTileCountLimit(500_000L)
         allLoadedPois = RoutingService.loadCachedPois(context)
+        allLoadedPeaks = RoutingService.loadCachedPeaks(context)
+        weatherData = RoutingService.loadCachedWeather(context)
+        refreshSavedRegions()
     }
 
-    // Aggiorna POI disegnati sulla mappa quando cambiano filtri o lista
     LaunchedEffect(activePoiFilters, allLoadedPois, mapLibreMap) {
         val filtered = allLoadedPois.filter { it.category in activePoiFilters }
         drawPoisOnMap(mapLibreMap, filtered)
+    }
+
+    LaunchedEffect(allLoadedPeaks, is3DEnabled, mapLibreMap) {
+        drawPeaksOnMap(mapLibreMap, if (is3DEnabled) allLoadedPeaks else emptyList())
     }
 
     val gpxImporter = rememberLauncherForActivityResult(
@@ -167,7 +223,6 @@ fun MapScreen() {
         }
     }
 
-    // Ricerca luoghi Photon con debounce
     LaunchedEffect(searchQuery) {
         if (searchQuery.trim().length < 2) {
             searchResults = emptyList()
@@ -188,6 +243,16 @@ fun MapScreen() {
         }
     }
 
+    fun triggerWeatherAnalysis(target: LatLng, altOverride: Int? = selectedAltitudeOverride) {
+        weatherTargetLatLng = target
+        showWeatherSheet = true
+        isLoadingWeather = true
+        scope.launch {
+            weatherData = RoutingService.fetchFullAlpineWeather(context, target.latitude, target.longitude, altOverride)
+            isLoadingWeather = false
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -195,7 +260,7 @@ fun MapScreen() {
                 MapView(ctx).apply {
                     getMapAsync { map ->
                         mapLibreMap = map
-                        applyMapStyle(map, currentLayer, is3DEnabled) {
+                        applyMapStyle(map, currentLayer, is3DEnabled, sunHour) {
                             enableUserLocation(ctx, map)
                         }
                         map.cameraPosition = CameraPosition.Builder()
@@ -203,7 +268,6 @@ fun MapScreen() {
                             .zoom(11.0)
                             .build()
 
-                        // Tocco rapido sulla mappa: controllo se ha toccato un POI
                         map.addOnMapClickListener { latLng ->
                             val screenPoint = map.projection.toScreenLocation(latLng)
                             val features = map.queryRenderedFeatures(screenPoint, "poi-circles")
@@ -222,7 +286,6 @@ fun MapScreen() {
                             }
                         }
 
-                        // Pressione prolungata sulla mappa: Meteo in quota + Rotta/Navigazione Offline
                         map.addOnMapLongClickListener { latLng ->
                             if (isPlanningMode) {
                                 val clicked = TrackPoint(latLng.latitude, latLng.longitude)
@@ -234,7 +297,6 @@ fun MapScreen() {
                                     routeStart = null
                                     isPlanningMode = false
                                     scope.launch {
-                                        Toast.makeText(ctx, "Calcolo percorso...", Toast.LENGTH_SHORT).show()
                                         val route = RoutingService.calculateHikingRoute(start, clicked)
                                         if (route != null) {
                                             activeTrack = route
@@ -244,15 +306,9 @@ fun MapScreen() {
                                     }
                                 }
                             } else {
-                                selectedWeatherPoint = latLng
                                 targetWaypoint = String.format(Locale.US, "Punto %.4f, %.4f", latLng.latitude, latLng.longitude) to latLng
                                 drawTargetLine(map, userCurrentLatLng, latLng)
-                                isLoadingWeather = true
-                                weatherReport = null
-                                scope.launch {
-                                    weatherReport = RoutingService.fetchAlpineWeather(latLng.latitude, latLng.longitude)
-                                    isLoadingWeather = false
-                                }
+                                triggerWeatherAnalysis(latLng)
                             }
                             true
                         }
@@ -261,12 +317,12 @@ fun MapScreen() {
             }
         )
 
-        // BARRA SUPERIORE: RICERCA + CHIP POI SELEZIONABILI
+        // BARRA SUPERIORE PULITA: RICERCA + CHIP POI + PILLOLA BUSSOLA/QUOTA
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
             Surface(
                 modifier = Modifier
@@ -276,14 +332,14 @@ fun MapScreen() {
                 color = Color.White
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF1B4332))
                     TextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        placeholder = { Text("Cerca vette, rifugi, passi...", color = Color.Gray, fontSize = 14.sp) },
+                        placeholder = { Text("Cerca vette, rifugi, canali...", color = Color.Gray, fontSize = 14.sp) },
                         modifier = Modifier.weight(1f),
                         colors = TextFieldDefaults.colors(
                             focusedTextColor = Color.Black,
@@ -308,7 +364,6 @@ fun MapScreen() {
                 }
             }
 
-            // Risultati ricerca Photon
             if (searchResults.isNotEmpty()) {
                 Surface(
                     modifier = Modifier
@@ -318,7 +373,7 @@ fun MapScreen() {
                     shape = RoundedCornerShape(16.dp),
                     color = Color.White
                 ) {
-                    LazyColumn(modifier = Modifier.heightIn(max = 240.dp)) {
+                    LazyColumn(modifier = Modifier.heightIn(max = 220.dp)) {
                         items(searchResults) { place ->
                             Column(
                                 modifier = Modifier
@@ -346,7 +401,7 @@ fun MapScreen() {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 8.dp)
+                    .padding(top = 6.dp)
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
@@ -361,9 +416,11 @@ fun MapScreen() {
                                 mapLibreMap?.projection?.visibleRegion?.latLngBounds?.let { b ->
                                     isLoadingPois = true
                                     scope.launch {
-                                        allLoadedPois = RoutingService.fetchPoisInBounds(
+                                        val (pois, peaks) = RoutingService.fetchPoisAndPeaksInBounds(
                                             context, b.latitudeSouth, b.longitudeWest, b.latitudeNorth, b.longitudeEast
                                         )
+                                        allLoadedPois = pois
+                                        allLoadedPeaks = peaks
                                         isLoadingPois = false
                                     }
                                 }
@@ -372,12 +429,12 @@ fun MapScreen() {
                         label = {
                             Text(
                                 text = if (isLoadingPois && selected) "${cat.label}..." else cat.label,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Medium
                             )
                         },
                         colors = FilterChipDefaults.filterChipColors(
-                            containerColor = Color.White.copy(alpha = 0.95f),
+                            containerColor = Color.White.copy(alpha = 0.94f),
                             labelColor = Color.Black,
                             selectedContainerColor = Color(android.graphics.Color.parseColor(cat.colorHex)),
                             selectedLabelColor = Color.White
@@ -386,88 +443,103 @@ fun MapScreen() {
                 }
             }
 
-            // HUD Alpinismo (Altimetro barometrico + UTM + Bussola bersaglio)
-            if (showAlpineHud || targetWaypoint != null) {
+            // Pillola compatta Bussola + Quota sempre visibile in alto
+            val loc = mapLibreMap?.locationComponent?.lastKnownLocation
+            if (loc != null) userCurrentLatLng = LatLng(loc.latitude, loc.longitude)
+            val altStr = baroAltitude?.let { "${it.toInt()}m" } ?: loc?.altitude?.let { "${it.toInt()}m" } ?: "--"
+            val cardinal = when (((compassAzimuth + 22.5f) % 360f).toInt() / 45) {
+                0 -> "N"; 1 -> "NE"; 2 -> "E"; 3 -> "SE"; 4 -> "S"; 5 -> "SO"; 6 -> "O"; else -> "NO"
+            }
+
+            Row(
+                modifier = Modifier.padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp)
-                        .shadow(4.dp, RoundedCornerShape(12.dp)),
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color(0xFF1B4332).copy(alpha = 0.94f)
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color(0xFF1B4332).copy(alpha = 0.90f)
                 ) {
-                    Column(modifier = Modifier.padding(10.dp)) {
-                        val loc = mapLibreMap?.locationComponent?.lastKnownLocation
-                        if (loc != null) {
-                            userCurrentLatLng = LatLng(loc.latitude, loc.longitude)
-                        }
-                        val altStr = baroAltitude?.let { "${it.toInt()} m (Baro)" }
-                            ?: loc?.altitude?.let { "${it.toInt()} m (GPS)" } ?: "N/D"
-                        val utmStr = loc?.let { RoutingService.toUtmString(it.latitude, it.longitude) } ?: "Attesa GPS..."
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Navigation,
+                            contentDescription = "Bussola",
+                            tint = Color(0xFFE63946),
+                            modifier = Modifier.size(14.dp).rotate(-compassAzimuth)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("${compassAzimuth.toInt()}° $cardinal", color = Color(0xFFFFD166), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("  •  Alt: $altStr", color = Color.White, fontSize = 12.sp)
+                    }
+                }
 
+                targetWaypoint?.let { (wpName, wpLatLng) ->
+                    val distTxt = userCurrentLatLng?.let { u ->
+                        val d = GpxManager.haversineDistance(u.latitude, u.longitude, wpLatLng.latitude, wpLatLng.longitude)
+                        if (d >= 1000) String.format(Locale.US, "%.1fkm", d / 1000.0) else "${d.toInt()}m"
+                    } ?: ""
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color(0xFFE65100).copy(alpha = 0.92f)
+                    ) {
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("Quota: $altStr", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            Text("UTM: $utmStr", color = Color(0xFFB7E4C7), fontSize = 11.sp)
-                        }
-
-                        targetWaypoint?.let { (wpName, wpLatLng) ->
-                            Spacer(modifier = Modifier.height(4.dp))
-                            val distTxt = userCurrentLatLng?.let { u ->
-                                val d = GpxManager.haversineDistance(u.latitude, u.longitude, wpLatLng.latitude, wpLatLng.longitude)
-                                if (d >= 1000) String.format(Locale.US, "%.2f km", d / 1000.0) else "${d.toInt()} m"
-                            } ?: "N/D"
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Obiettivo: $wpName ($distTxt)",
-                                    color = Color(0xFFFFD166),
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Icon(
-                                    Icons.Default.Close,
-                                    contentDescription = "Chiudi obiettivo",
-                                    tint = Color.White,
-                                    modifier = Modifier
-                                        .size(18.dp)
-                                        .clickable {
-                                            targetWaypoint = null
-                                            drawTargetLine(mapLibreMap, null, null)
-                                        }
-                                )
-                            }
+                            Text("$wpName $distTxt", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Chiudi",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp).clickable {
+                                    targetWaypoint = null
+                                    drawTargetLine(mapLibreMap, null, null)
+                                }
+                            )
                         }
                     }
                 }
             }
         }
 
-        // PULSANTI LATERALI DESTRA
+        // SOLO 4 PULSANTI ESSENZIALI A DESTRA (Schermata pulita!)
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
                 .padding(end = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(9.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Vista 3D tipo PeakVisor
+            // 1. Vista 3D volumetrica con vette
             SmallFloatingActionButton(
                 onClick = {
                     is3DEnabled = !is3DEnabled
+                    if (is3DEnabled && currentLayer == MapLayerType.ALPINE) {
+                        currentLayer = MapLayerType.SATELLITE
+                    } else if (!is3DEnabled && currentLayer == MapLayerType.SATELLITE) {
+                        currentLayer = MapLayerType.ALPINE
+                    }
                     mapLibreMap?.let { map ->
-                        applyMapStyle(map, currentLayer, is3DEnabled) {
-                            activeTrack?.let { drawTrackOnMap(map, it.points) }
-                            val filtered = allLoadedPois.filter { it.category in activePoiFilters }
-                            drawPoisOnMap(map, filtered)
+                        if (is3DEnabled) {
+                            val b = map.projection.visibleRegion.latLngBounds
+                            scope.launch {
+                                val (pois, peaks) = RoutingService.fetchPoisAndPeaksInBounds(
+                                    context, b.latitudeSouth, b.longitudeWest, b.latitudeNorth, b.longitudeEast
+                                )
+                                allLoadedPois = pois
+                                allLoadedPeaks = peaks
+                            }
                         }
-                        val targetPitch = if (is3DEnabled) 60.0 else 0.0
-                        val targetZoom = if (is3DEnabled && map.cameraPosition.zoom < 12.5) 13.0 else map.cameraPosition.zoom
+                        applyMapStyle(map, currentLayer, is3DEnabled, sunHour) {
+                            activeTrack?.let { drawTrackOnMap(map, it.points) }
+                            drawPoisOnMap(map, allLoadedPois.filter { it.category in activePoiFilters })
+                            drawPeaksOnMap(map, if (is3DEnabled) allLoadedPeaks else emptyList())
+                        }
+                        val targetPitch = if (is3DEnabled) 68.0 else 0.0
+                        val targetZoom = if (is3DEnabled && map.cameraPosition.zoom < 12.5) 13.2 else map.cameraPosition.zoom
                         map.animateCamera(
                             CameraUpdateFactory.newCameraPosition(
                                 CameraPosition.Builder()
@@ -478,7 +550,6 @@ fun MapScreen() {
                             )
                         )
                     }
-                    Toast.makeText(context, if (is3DEnabled) "Vista 3D Orografica attiva (ruota con 2 dita)" else "Vista 2D", Toast.LENGTH_SHORT).show()
                 },
                 containerColor = if (is3DEnabled) Color(0xFF1B4332) else Color.White,
                 contentColor = if (is3DEnabled) Color.White else Color(0xFF1B4332)
@@ -486,58 +557,40 @@ fun MapScreen() {
                 Text("3D", fontWeight = FontWeight.Bold, fontSize = 13.sp)
             }
 
-            // Stili mappa (incluso Pendenze/Canali 30-45°)
+            // 2. Stili Mappa (Alpina, Swisstopo, Pendenze Canali, Satellitare)
             SmallFloatingActionButton(
                 onClick = { showLayerMenu = !showLayerMenu },
                 containerColor = Color.White,
                 contentColor = Color(0xFF1B4332)
             ) {
-                Icon(Icons.Default.Layers, contentDescription = "Stili Mappa")
+                Icon(Icons.Default.Layers, contentDescription = "Mappe")
             }
 
-            // Strumenti Alpinismo (Altimetro + UTM)
-            SmallFloatingActionButton(
-                onClick = { showAlpineHud = !showAlpineHud },
-                containerColor = if (showAlpineHud) Color(0xFF1B4332) else Color.White,
-                contentColor = if (showAlpineHud) Color.White else Color(0xFF1B4332)
-            ) {
-                Icon(Icons.Default.Explore, contentDescription = "Strumenti Alpinismo")
-            }
-
-            // Pianifica percorso
+            // 3. Meteo Alpinistico 5 Giorni & Bollettini Valanghe
             SmallFloatingActionButton(
                 onClick = {
-                    isPlanningMode = !isPlanningMode
-                    routeStart = null
-                    val msg = if (isPlanningMode) "Tieni premuto sulla partenza, poi sulla meta" else "Pianificazione annullata"
-                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                    val target = targetWaypoint?.second ?: mapLibreMap?.cameraPosition?.target
+                    if (target != null) {
+                        triggerWeatherAnalysis(target)
+                    }
                 },
-                containerColor = if (isPlanningMode) Color(0xFF1B4332) else Color.White,
-                contentColor = if (isPlanningMode) Color.White else Color(0xFF1B4332)
+                containerColor = if (showWeatherSheet) Color(0xFF0288D1) else Color.White,
+                contentColor = if (showWeatherSheet) Color.White else Color(0xFF0288D1)
             ) {
-                Icon(Icons.Default.DirectionsWalk, contentDescription = "Pianifica")
+                Icon(Icons.Default.Cloud, contentDescription = "Meteo & Bollettini")
             }
 
-            // Importa GPX
+            // 4. Menu Strumenti Unificato (Sole 3D, Inclinometro, PeakFinder, GPX, Offline/Aggiorna, SOS)
             SmallFloatingActionButton(
-                onClick = { gpxImporter.launch(arrayOf("*/*")) },
-                containerColor = Color.White,
-                contentColor = Color(0xFF1B4332)
+                onClick = { showToolsMenu = true },
+                containerColor = Color(0xFF1B4332),
+                contentColor = Color.White
             ) {
-                Icon(Icons.Default.FileOpen, contentDescription = "Apri GPX")
-            }
-
-            // Download Area Offline (sbloccato e con stile JSON pulito)
-            SmallFloatingActionButton(
-                onClick = { showOfflineConfirm = true },
-                containerColor = Color.White,
-                contentColor = Color(0xFF1B4332)
-            ) {
-                Icon(Icons.Default.DownloadForOffline, contentDescription = "Scarica Offline")
+                Icon(Icons.Default.Tune, contentDescription = "Strumenti Alpinismo")
             }
         }
 
-        // MENU LAYER MAPPA
+        // MENU SCELTA LAYER MAPPA
         if (showLayerMenu) {
             Surface(
                 modifier = Modifier
@@ -555,10 +608,10 @@ fun MapScreen() {
                                     currentLayer = layer
                                     showLayerMenu = false
                                     mapLibreMap?.let { map ->
-                                        applyMapStyle(map, layer, is3DEnabled) {
+                                        applyMapStyle(map, layer, is3DEnabled, sunHour) {
                                             activeTrack?.let { drawTrackOnMap(map, it.points) }
-                                            val filtered = allLoadedPois.filter { it.category in activePoiFilters }
-                                            drawPoisOnMap(map, filtered)
+                                            drawPoisOnMap(map, allLoadedPois.filter { it.category in activePoiFilters })
+                                            drawPeaksOnMap(map, if (is3DEnabled) allLoadedPeaks else emptyList())
                                         }
                                     }
                                 }
@@ -578,46 +631,78 @@ fun MapScreen() {
             }
         }
 
-        // FINESTRA CONFERMA DOWNLOAD AREA OFFLINE
-        if (showOfflineConfirm) {
-            AlertDialog(
-                onDismissRequest = { showOfflineConfirm = false },
-                containerColor = Color.White,
-                title = { Text("Scarica Area Offline", fontWeight = FontWeight.Bold, color = Color.Black) },
-                text = {
-                    Text(
-                        "Verrà salvata l'area attualmente inquadrata sullo schermo (zoom 10–15) insieme ai Rifugi, Sorgenti, Falesie e Ferrate della zona per la navigazione senza rete.",
-                        color = Color.DarkGray,
-                        fontSize = 14.sp
-                    )
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            showOfflineConfirm = false
+        // OVERLAY SIMULATORE SOLE / OMBRA 3D (se attivato dal menu)
+        if (showSunSimulator) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 135.dp, start = 16.dp, end = 16.dp)
+                    .fillMaxWidth()
+                    .shadow(6.dp, RoundedCornerShape(16.dp)),
+                shape = RoundedCornerShape(16.dp),
+                color = Color.White
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Esposizione Sole/Ombra: Ore ${sunHour.toInt()}:00", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Black)
+                        Icon(Icons.Default.Close, contentDescription = "Chiudi", tint = Color.Gray, modifier = Modifier.size(18.dp).clickable { showSunSimulator = false })
+                    }
+                    Slider(
+                        value = sunHour,
+                        onValueChange = {
+                            sunHour = it
                             mapLibreMap?.let { map ->
-                                val b = map.projection.visibleRegion.latLngBounds
-                                scope.launch {
-                                    allLoadedPois = RoutingService.fetchPoisInBounds(
-                                        context, b.latitudeSouth, b.longitudeWest, b.latitudeNorth, b.longitudeEast
-                                    )
-                                }
-                                downloadCurrentRegionOffline(context, map, currentLayer) { prog ->
-                                    offlineProgress = prog
+                                applyMapStyle(map, currentLayer, true, sunHour) {
+                                    activeTrack?.let { t -> drawTrackOnMap(map, t.points) }
                                 }
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B4332))
-                    ) {
-                        Text("Scarica Ora", color = Color.White)
+                        valueRange = 5f..21f,
+                        steps = 15
+                    )
+                }
+            }
+        }
+
+        // OVERLAY INCLINOMETRO PENDII (se attivato dal menu)
+        if (showInclinometer) {
+            val riskColor = when {
+                slopePitchDegrees in 30..45 -> Color(0xFFD32F2F)
+                slopePitchDegrees > 45 -> Color(0xFFE65100)
+                else -> Color(0xFF2E7D32)
+            }
+            val riskText = when {
+                slopePitchDegrees in 30..45 -> "FASCIA CRITICA VALANGHE (30°-45°)"
+                slopePitchDegrees > 45 -> "CANALE RIPIDO / ALPINISTICO (>45°)"
+                else -> "PENDENZA MODERATA (<30°)"
+            }
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 135.dp, start = 24.dp, end = 24.dp)
+                    .fillMaxWidth()
+                    .shadow(8.dp, RoundedCornerShape(16.dp)),
+                shape = RoundedCornerShape(16.dp),
+                color = riskColor
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Inclinazione: $slopePitchDegrees°", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        Text(riskText, color = Color.White.copy(alpha = 0.9f), fontSize = 11.sp)
                     }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showOfflineConfirm = false }) {
-                        Text("Annulla", color = Color.Gray)
+                    IconButton(onClick = { showInclinometer = false }) {
+                        Icon(Icons.Default.Close, contentDescription = "Chiudi", tint = Color.White)
                     }
                 }
-            )
+            }
         }
 
         // INDICATORE PROGRESSO DOWNLOAD OFFLINE
@@ -625,12 +710,12 @@ fun MapScreen() {
             Surface(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 125.dp),
+                    .padding(top = 135.dp),
                 shape = RoundedCornerShape(20.dp),
                 color = Color(0xFF1B4332)
             ) {
                 Text(
-                    text = "Download offline: ${(prog * 100).toInt()}%",
+                    text = "Aggiornamento / Download offline: ${(prog * 100).toInt()}%",
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                     fontSize = 13.sp
@@ -638,77 +723,380 @@ fun MapScreen() {
             }
         }
 
-        // SCHEDA ANALISI METEO IN QUOTA (Zero Termico, Vento, Nuvole)
-        if (selectedWeatherPoint != null) {
+        // PANNELLO MENU STRUMENTI UNIFICATO ("MAGRO")
+        if (showToolsMenu) {
+            AlertDialog(
+                onDismissRequest = { showToolsMenu = false },
+                containerColor = Color.White,
+                title = { Text("Strumenti Alpinismo", fontWeight = FontWeight.Bold, color = Color(0xFF1B4332)) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        ToolMenuRow(Icons.Default.WbSunny, "Simulatore Sole / Ombra 3D", "Verifica orario sole su canali e falesie") {
+                            showToolsMenu = false
+                            is3DEnabled = true
+                            showSunSimulator = true
+                        }
+                        ToolMenuRow(Icons.Default.Straighten, "Inclinometro Pendii", "Misura pendenza in gradi (30°-45° valanghe)") {
+                            showToolsMenu = false
+                            showInclinometer = true
+                        }
+                        ToolMenuRow(Icons.Default.Terrain, "Identificatore Cime / Orizzonte", "Vette visibili nel raggio con quota e distanza") {
+                            showToolsMenu = false
+                            mapLibreMap?.projection?.visibleRegion?.latLngBounds?.let { b ->
+                                scope.launch {
+                                    val (pois, peaks) = RoutingService.fetchPoisAndPeaksInBounds(
+                                        context, b.latitudeSouth, b.longitudeWest, b.latitudeNorth, b.longitudeEast
+                                    )
+                                    allLoadedPois = pois
+                                    allLoadedPeaks = peaks
+                                    showPeakFinderDialog = true
+                                }
+                            } ?: run { showPeakFinderDialog = true }
+                        }
+                        ToolMenuRow(Icons.Default.Route, "Pianifica Percorso / Importa GPX", "Traccia itinerario o apri file GPX") {
+                            showToolsMenu = false
+                            gpxImporter.launch(arrayOf("*/*"))
+                        }
+                        ToolMenuRow(Icons.Default.DownloadForOffline, "Mappe Offline & Aggiorna Dati", "Scarica o aggiorna mappe, POI e meteo locale") {
+                            showToolsMenu = false
+                            refreshSavedRegions()
+                            showOfflineDialog = true
+                        }
+                        HorizontalDivider()
+                        ToolMenuRow(Icons.Default.Sos, "SOS Soccorso Alpino (112 / GeoResQ)", "Prepara SMS/WhatsApp con WGS84 + UTM + Quota", tint = Color(0xFFD32F2F)) {
+                            showToolsMenu = false
+                            showSosConfirmDialog = true
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showToolsMenu = false }) {
+                        Text("Chiudi", color = Color(0xFF1B4332))
+                    }
+                }
+            )
+        }
+
+        // IDENTIFICATORE CIME / ORIZZONTE
+        if (showPeakFinderDialog) {
+            val refPoint = userCurrentLatLng ?: mapLibreMap?.cameraPosition?.target ?: LatLng(45.5, 7.6)
+            val sortedPeaks = allLoadedPeaks.map { pk ->
+                val d = GpxManager.haversineDistance(refPoint.latitude, refPoint.longitude, pk.lat, pk.lon)
+                val brg = RoutingService.calculateBearing(refPoint.latitude, refPoint.longitude, pk.lat, pk.lon)
+                Triple(pk, d, brg)
+            }.sortedBy { it.second }.take(20)
+
+            AlertDialog(
+                onDismissRequest = { showPeakFinderDialog = false },
+                containerColor = Color.White,
+                title = { Text("Cime nell'Orizzonte", fontWeight = FontWeight.Bold, color = Color.Black) },
+                text = {
+                    if (sortedPeaks.isEmpty()) {
+                        Text("Nessuna cima caricata in questa area. Avvicina o sposta la mappa su un gruppo montuoso.", color = Color.Gray)
+                    } else {
+                        LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
+                            items(sortedPeaks) { (pk, dist, brg) ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            showPeakFinderDialog = false
+                                            val dest = LatLng(pk.lat, pk.lon)
+                                            targetWaypoint = "${pk.name} (${pk.elevationMeters}m)" to dest
+                                            drawTargetLine(mapLibreMap, userCurrentLatLng, dest)
+                                            mapLibreMap?.animateCamera(CameraUpdateFactory.newLatLngZoom(dest, 14.0))
+                                        }
+                                        .padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("${pk.name} (${pk.elevationMeters} m)", fontWeight = FontWeight.Bold, color = Color.Black, fontSize = 14.sp)
+                                        Text("Rilevamento bussola: $brg°", fontSize = 12.sp, color = Color.Gray)
+                                    }
+                                    Text(String.format(Locale.US, "%.1f km", dist / 1000.0), fontWeight = FontWeight.Bold, color = Color(0xFF1B4332), fontSize = 13.sp)
+                                }
+                                HorizontalDivider(color = Color(0xFFEEEEEE))
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showPeakFinderDialog = false }) { Text("Chiudi", color = Color(0xFF1B4332)) }
+                }
+            )
+        }
+
+        // FINESTRA SOS SOCCORSO ALPINO (PROTETTA)
+        if (showSosConfirmDialog) {
+            val loc = mapLibreMap?.locationComponent?.lastKnownLocation
+            val lat = loc?.latitude ?: mapLibreMap?.cameraPosition?.target?.latitude ?: 0.0
+            val lon = loc?.longitude ?: mapLibreMap?.cameraPosition?.target?.longitude ?: 0.0
+            val utm = RoutingService.toUtmString(lat, lon)
+            val alt = baroAltitude?.toInt() ?: loc?.altitude?.toInt() ?: 0
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            val bat = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            val sosMsg = "EMERGENZA SOCCORSO ALPINO
+Posizione WGS84: ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}
+Coordinate UTM: $utm
+Quota: ${alt}m slm
+Batteria telefono: $bat%"
+
+            AlertDialog(
+                onDismissRequest = { showSosConfirmDialog = false },
+                containerColor = Color.White,
+                title = { Text("SOS Soccorso Alpino (112)", fontWeight = FontWeight.Bold, color = Color(0xFFD32F2F)) },
+                text = { Text(sosMsg, color = Color.Black, fontSize = 13.sp) },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showSosConfirmDialog = false
+                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, sosMsg)
+                            }
+                            context.startActivity(Intent.createChooser(sendIntent, "Invia coordinate SOS tramite"))
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                    ) {
+                        Text("Invia Coordinate SOS", color = Color.White)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showSosConfirmDialog = false }) { Text("Annulla", color = Color.Gray) }
+                }
+            )
+        }
+
+        // GESTIONE MAPPE OFFLINE & AGGIORNAMENTO DATI
+        if (showOfflineDialog) {
+            AlertDialog(
+                onDismissRequest = { showOfflineDialog = false },
+                containerColor = Color.White,
+                title = { Text("Mappe Offline & Aggiorna Dati", fontWeight = FontWeight.Bold, color = Color.Black) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            "Scarica l'area inquadrata (mappa, cime 3D, rifugi, sorgenti, ferrate e bollettini) oppure aggiorna i dati locali sotto Wi-Fi.",
+                            fontSize = 13.sp,
+                            color = Color.DarkGray
+                        )
+                        Button(
+                            onClick = {
+                                showOfflineDialog = false
+                                mapLibreMap?.let { map ->
+                                    val b = map.projection.visibleRegion.latLngBounds
+                                    scope.launch {
+                                        val (pois, peaks) = RoutingService.fetchPoisAndPeaksInBounds(
+                                            context, b.latitudeSouth, b.longitudeWest, b.latitudeNorth, b.longitudeEast
+                                        )
+                                        allLoadedPois = pois
+                                        allLoadedPeaks = peaks
+                                        val center = map.cameraPosition.target
+                                        if (center != null) {
+                                            weatherData = RoutingService.fetchFullAlpineWeather(context, center.latitude, center.longitude, null)
+                                        }
+                                    }
+                                    downloadCurrentRegionOffline(context, map, currentLayer) { prog ->
+                                        offlineProgress = prog
+                                        if (prog == null) refreshSavedRegions()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1B4332))
+                        ) {
+                            Icon(Icons.Default.Download, contentDescription = null, tint = Color.White)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Scarica / Aggiorna Area Inquadrata", color = Color.White)
+                        }
+
+                        if (savedRegions.isNotEmpty()) {
+                            HorizontalDivider()
+                            Text("Aree salvate in locale (${savedRegions.size}):", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Black)
+                            savedRegions.forEach { (title, reg) ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(title, fontSize = 13.sp, color = Color.Black, modifier = Modifier.weight(1f))
+                                    IconButton(onClick = {
+                                        reg.setDownloadState(OfflineRegion.STATE_ACTIVE)
+                                        Toast.makeText(context, "Aggiornamento tessere avviato...", Toast.LENGTH_SHORT).show()
+                                    }) {
+                                        Icon(Icons.Default.Refresh, contentDescription = "Aggiorna", tint = Color(0xFF1B4332))
+                                    }
+                                    IconButton(onClick = {
+                                        reg.delete(object : OfflineRegion.OfflineRegionDeleteCallback {
+                                            override fun onDelete() { refreshSavedRegions() }
+                                            override fun onError(error: String) {}
+                                        })
+                                    }) {
+                                        Icon(Icons.Default.Delete, contentDescription = "Elimina", tint = Color.Red)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showOfflineDialog = false }) { Text("Chiudi", color = Color(0xFF1B4332)) }
+                }
+            )
+        }
+
+        // SCHEDA METEO ALPINISTICO 5 GIORNI + BOLLETTINO VALANGHE + ALLERTE UFFICIALI
+        if (showWeatherSheet) {
             Surface(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .padding(12.dp)
-                    .shadow(14.dp, RoundedCornerShape(20.dp)),
-                shape = RoundedCornerShape(20.dp),
+                    .heightIn(max = 520.dp)
+                    .shadow(16.dp, RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)),
+                shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
                 color = Color.White
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Analisi Meteo Alpinistica", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(0xFF1B4332))
-                        IconButton(
-                            onClick = {
-                                selectedWeatherPoint = null
-                                weatherReport = null
-                            },
-                            modifier = Modifier.size(28.dp)
-                        ) {
+                        Text("Meteo Alpinismo & Valanghe", fontWeight = FontWeight.Bold, fontSize = 17.sp, color = Color(0xFF1B4332))
+                        IconButton(onClick = { showWeatherSheet = false }, modifier = Modifier.size(28.dp)) {
                             Icon(Icons.Default.Close, contentDescription = "Chiudi", tint = Color.Gray)
                         }
                     }
 
+                    // Selettore Quota Reale (Modello vs 2000m, 3000m, 4000m)
+                    val altOptions = listOf(null to "Quota Punto", 2000 to "2000 m", 3000 to "3000 m", 4000 to "4000 m")
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        altOptions.forEach { (altVal, lbl) ->
+                            FilterChip(
+                                selected = selectedAltitudeOverride == altVal,
+                                onClick = {
+                                    selectedAltitudeOverride = altVal
+                                    weatherTargetLatLng?.let { triggerWeatherAnalysis(it, altVal) }
+                                },
+                                label = { Text(lbl, fontSize = 11.sp) }
+                            )
+                        }
+                    }
+
                     if (isLoadingWeather) {
-                        Row(modifier = Modifier.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(modifier = Modifier.padding(vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = Color(0xFF1B4332))
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text("Analisi quota, zero termico e vento...", color = Color.Gray, fontSize = 13.sp)
+                            Text("Scaricamento modelli alta risoluzione e bollettino valanghe...", fontSize = 13.sp, color = Color.Gray)
                         }
-                    } else if (weatherReport != null) {
-                        val w = weatherReport!!
-                        Text(
-                            text = w.summaryWarning,
-                            color = Color(0xFFD32F2F),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(vertical = 4.dp)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            StatBox("Quota Punto", "${w.elevationMeters} m")
-                            StatBox("Zero Termico", "${w.freezingLevelCurrent} m")
-                            StatBox("Range 0°C (24h)", "${w.freezingLevelMin24h}-${w.freezingLevelMax24h}m")
+                    } else if (weatherData != null) {
+                        val wd = weatherData!!
+
+                        // Eventuale Allerta Ufficiale Protezione Civile / MeteoAlarm
+                        wd.officialAlert?.let { alertMsg ->
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                color = Color(0xFFFFEBEE)
+                            ) {
+                                Text(alertMsg, color = Color(0xFFC62828), fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.padding(8.dp))
+                            }
                         }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            StatBox("Temp. Quota", "${w.tempAtElevation} °C")
-                            StatBox("Vento / Raffiche", "${w.windSpeedKmh.toInt()}/${w.windGustsKmh.toInt()} km/h")
-                            StatBox("Prob. Precip.", "${w.precipitationProbMax}%")
+
+                        // Riquadro Bollettino Valanghe Ufficiale
+                        wd.avalanche?.let { av ->
+                            val badgeColor = when (av.dangerRating) {
+                                1 -> Color(0xFF4CAF50)
+                                2 -> Color(0xFFFBC02D)
+                                3 -> Color(0xFFF57C00)
+                                4, 5 -> Color(0xFFD32F2F)
+                                else -> Color(0xFF455A64)
+                            }
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                color = Color(0xFFF5F7F8)
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Surface(shape = RoundedCornerShape(6.dp), color = badgeColor) {
+                                            Text(av.dangerLabel, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(av.regionName, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Black)
+                                    }
+                                    Text("Problema: ${av.problemTitle}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1B4332), modifier = Modifier.padding(top = 4.dp))
+                                    Text(av.summaryText, fontSize = 11.sp, color = Color.DarkGray, modifier = Modifier.padding(top = 2.dp))
+                                }
+                            }
                         }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "Nuvolosità: Basse (nebbia) ${w.cloudCoverLow}% • Medie ${w.cloudCoverMid}% • Alte ${w.cloudCoverHigh}%",
-                            fontSize = 12.sp,
-                            color = Color.DarkGray
-                        )
+
+                        // Selettore Giorni (5 giorni)
+                        if (wd.days.isNotEmpty()) {
+                            val safeIndex = minOf(selectedDayIndex, wd.days.size - 1)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 6.dp)
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                wd.days.forEachIndexed { idx, day ->
+                                    FilterChip(
+                                        selected = safeIndex == idx,
+                                        onClick = { selectedDayIndex = idx },
+                                        label = { Text(day.dateLabel, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+                                    )
+                                }
+                            }
+
+                            // Tabella Oraria (00 - 21)
+                            val currentDay = wd.days[safeIndex]
+                            Row(
+                                modifier = Modifier.fillMaxWidth().background(Color(0xFF1B4332)).padding(vertical = 6.dp, horizontal = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("Ora", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(0.9f))
+                                Text("T / Perc", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.2f))
+                                Text("Zero 0°C", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.1f))
+                                Text("Vento/Raf", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1.3f))
+                                Text("Nuv.B/M", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            }
+
+                            currentDay.slots.forEach { s ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp, horizontal = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(s.timeLabel, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Black, modifier = Modifier.weight(0.9f))
+                                    Text("${s.tempAtTarget}°/${s.feelsLike}°", fontSize = 11.sp, color = if (s.tempAtTarget <= 0) Color(0xFF0277BD) else Color.Black, modifier = Modifier.weight(1.2f))
+                                    Text("${s.freezingLevel}m", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1B4332), modifier = Modifier.weight(1.1f))
+                                    Text("${s.windKmh}/${s.gustsKmh}kmh", fontSize = 11.sp, color = if (s.gustsKmh >= 55) Color(0xFFD32F2F) else Color.Black, modifier = Modifier.weight(1.3f))
+                                    Text("${s.cloudLow}%/${s.cloudMid}%", fontSize = 11.sp, color = Color.DarkGray, modifier = Modifier.weight(1f))
+                                }
+                                HorizontalDivider(color = Color(0xFFEEEEEE))
+                            }
+                        }
                     } else {
-                        Text("Dati meteo non disponibili (offline)", color = Color.Gray, fontSize = 13.sp)
+                        Text("Tocca un punto o una vetta per caricare il bollettino meteo e valanghe.", color = Color.Gray, fontSize = 13.sp)
                     }
                 }
             }
         }
 
-        // CONTROLLI IN BASSO (REGISTRAZIONE + POSIZIONE + PANNELLO TRACCIA GPX)
-        if (selectedWeatherPoint == null) {
+        // CONTROLLI IN BASSO (REGISTRA + POSIZIONE + PANNELLO GPX)
+        if (!showWeatherSheet) {
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -797,6 +1185,30 @@ fun MapScreen() {
 }
 
 @Composable
+private fun ToolMenuRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    tint: Color = Color(0xFF1B4332),
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(24.dp))
+        Spacer(modifier = Modifier.width(12.dp))
+        Column {
+            Text(title, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color.Black)
+            Text(subtitle, fontSize = 11.sp, color = Color.Gray)
+        }
+    }
+}
+
+@Composable
 private fun StatBox(label: String, value: String) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(label, fontSize = 11.sp, color = Color.Gray)
@@ -806,11 +1218,11 @@ private fun StatBox(label: String, value: String) {
 
 private fun getCleanStyleJson(type: MapLayerType): String {
     return when (type) {
-        MapLayerType.OUTDOOR -> """
+        MapLayerType.ALPINE -> """
         {
           "version": 8,
           "sources": {
-            "osm": {
+            "topo": {
               "type": "raster",
               "tiles": ["https://tile.opentopomap.org/{z}/{x}/{y}.png"],
               "tileSize": 256
@@ -822,33 +1234,27 @@ private fun getCleanStyleJson(type: MapLayerType): String {
             }
           },
           "layers": [
-            { "id": "topo", "type": "raster", "source": "osm" },
+            { "id": "topo", "type": "raster", "source": "topo" },
             { "id": "hiking", "type": "raster", "source": "trails" }
           ]
         }
         """.trimIndent()
-        MapLayerType.SLOPES -> """
+        MapLayerType.SWISSTOPO -> """
         {
           "version": 8,
           "sources": {
-            "osm": {
+            "swiss": {
               "type": "raster",
-              "tiles": ["https://tile.opentopomap.org/{z}/{x}/{y}.png"],
-              "tileSize": 256
-            },
-            "slopes": {
-              "type": "raster",
-              "tiles": ["https://tile.waymarkedtrails.org/slopes/{z}/{x}/{y}.png"],
+              "tiles": ["https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-farbe/default/current/3857/{z}/{x}/{y}.jpeg"],
               "tileSize": 256
             }
           },
           "layers": [
-            { "id": "topo", "type": "raster", "source": "osm" },
-            { "id": "slopes", "type": "raster", "source": "slopes" }
+            { "id": "swiss-layer", "type": "raster", "source": "swiss" }
           ]
         }
         """.trimIndent()
-        MapLayerType.WINTER -> """
+        MapLayerType.SLOPES -> """
         {
           "version": 8,
           "sources": {
@@ -887,7 +1293,7 @@ private fun getCleanStyleJson(type: MapLayerType): String {
     }
 }
 
-private fun applyMapStyle(map: MapLibreMap, type: MapLayerType, enable3D: Boolean, onLoaded: () -> Unit) {
+private fun applyMapStyle(map: MapLibreMap, type: MapLayerType, enable3D: Boolean, sunHour: Float, onLoaded: () -> Unit) {
     map.setStyle(Style.Builder().fromJson(getCleanStyleJson(type))) { style ->
         if (enable3D) {
             try {
@@ -897,15 +1303,45 @@ private fun applyMapStyle(map: MapLibreMap, type: MapLayerType, enable3D: Boolea
                     256
                 )
                 style.addSource(demSource)
+                style.setTerrain(Terrain("terrain-dem").withExaggeration(1.35f))
+                val sunAzimuth = ((sunHour - 6f) / 14f * 180f + 90f).coerceIn(0f, 360f)
                 val hillshade = HillshadeLayer("terrain-hillshade", "terrain-dem").withProperties(
-                    PropertyFactory.hillshadeExaggeration(0.6f),
-                    PropertyFactory.hillshadeShadowColor("#1B263B")
+                    PropertyFactory.hillshadeExaggeration(0.55f),
+                    PropertyFactory.hillshadeIlluminationDirection(sunAzimuth),
+                    PropertyFactory.hillshadeShadowColor("#0D1B2A")
                 )
                 style.addLayer(hillshade)
             } catch (_: Exception) {
             }
         }
         onLoaded()
+    }
+}
+
+private fun drawPeaksOnMap(map: MapLibreMap?, peaks: List<PeakItem>) {
+    val style = map?.style ?: return
+    val sourceId = "peaks-source"
+    val layerId = "peaks-labels"
+    val features = peaks.map { pk ->
+        Feature.fromGeometry(Point.fromLngLat(pk.lon, pk.lat)).apply {
+            addStringProperty("label", "▲ ${pk.name} ${pk.elevationMeters}m")
+        }
+    }
+    val collection = FeatureCollection.fromFeatures(features)
+    val existing = style.getSourceAs<GeoJsonSource>(sourceId)
+    if (existing != null) {
+        existing.setGeoJson(collection)
+    } else {
+        style.addSource(GeoJsonSource(sourceId, collection))
+        val sym = SymbolLayer(layerId, sourceId).withProperties(
+            PropertyFactory.textField(Expression.get("label")),
+            PropertyFactory.textSize(12f),
+            PropertyFactory.textColor("#FFFFFF"),
+            PropertyFactory.textHaloColor("#1B4332"),
+            PropertyFactory.textHaloWidth(2f),
+            PropertyFactory.textAllowOverlap(false)
+        )
+        style.addLayer(sym)
     }
 }
 
@@ -930,7 +1366,7 @@ private fun drawPoisOnMap(map: MapLibreMap?, pois: List<PoiItem>) {
         style.addSource(GeoJsonSource(sourceId, collection))
         val circleLayer = CircleLayer(layerId, sourceId).withProperties(
             PropertyFactory.circleRadius(8f),
-            PropertyFactory.circleColor(org.maplibre.android.style.expressions.Expression.get("color")),
+            PropertyFactory.circleColor(Expression.get("color")),
             PropertyFactory.circleStrokeWidth(2f),
             PropertyFactory.circleStrokeColor("#FFFFFF")
         )
@@ -1026,8 +1462,8 @@ private fun downloadCurrentRegionOffline(
         context.resources.displayMetrics.density
     )
 
-    val metadata = "MapyOutdoor_Area".toByteArray(Charset.forName("UTF-8"))
-    Toast.makeText(context, "Avvio download area offline...", Toast.LENGTH_SHORT).show()
+    val metadata = "Area_${layerType.name}".toByteArray(Charset.forName("UTF-8"))
+    Toast.makeText(context, "Avvio scaricamento offline...", Toast.LENGTH_SHORT).show()
 
     offlineManager.createOfflineRegion(definition, metadata, object : OfflineManager.CreateOfflineRegionCallback {
         override fun onCreate(offlineRegion: OfflineRegion) {
@@ -1040,7 +1476,7 @@ private fun downloadCurrentRegionOffline(
                     onProgress(percentage)
                     if (status.isComplete) {
                         onProgress(null)
-                        Toast.makeText(context, "Mappa offline e POI salvati!", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "Mappa, POI, cime e bollettini aggiornati offline!", Toast.LENGTH_LONG).show()
                     }
                 }
 
@@ -1051,7 +1487,7 @@ private fun downloadCurrentRegionOffline(
 
                 override fun mapboxTileCountLimitExceeded(limit: Long) {
                     onProgress(null)
-                    Toast.makeText(context, "Area troppo ampia: avvicina leggermente lo zoom", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Area troppo grande: avvicina lo zoom", Toast.LENGTH_LONG).show()
                 }
             })
         }
