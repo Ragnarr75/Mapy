@@ -113,5 +113,33 @@ object GpxManager {
     }
 
     fun exportToGpxString(track: GpxTrack): String {
-        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        val sb = StringBuilder()
+        sb.appendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+        sb.appendLine("<gpx version=\"1.1\" creator=\"MapyOutdoor\" xmlns=\"http://www.topografix.com/GPX/1/1\">")
+        sb.appendLine("  <trk>")
+        sb.appendLine("    <name>${track.name}</name>")
+        sb.appendLine("    <trkseg>")
+        for (pt in track.points) {
+            sb.appendLine("      <trkpt lat=\"${pt.lat}\" lon=\"${pt.lon}\">")
+            sb.appendLine("        <ele>${pt.ele}</ele>")
+            sb.appendLine("        <time>${sdf.format(Date(pt.time))}</time>")
+            sb.appendLine("      </trkpt>")
+        }
+        sb.appendLine("    </trkseg>")
+        sb.appendLine("  </trk>")
+        sb.appendLine("</gpx>")
+        return sb.toString()
+    }
+
+    fun haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val r = 6371000.0
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLon = Math.toRadians(lon2 - lon1)
+        val a = sin(dLat / 2).pow(2.0) +
+                cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2.0)
+        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        return r * c
+    }
+}
