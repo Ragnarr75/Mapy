@@ -1217,7 +1217,6 @@ fun MapScreen() {
             val refLoc = userCurrentLatLng ?: mapLibreMap?.cameraPosition?.target ?: LatLng(45.8326, 6.8652)
             ArPeakFinderOverlay(
                 userLatLng = refLoc,
-                compassAzimuth = compassAzimuth,
                 peaks = allLoadedPeaks,
                 onSelectPeak = { pk ->
                     showArCamera = false
