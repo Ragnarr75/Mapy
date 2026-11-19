@@ -124,6 +124,7 @@ fun MapScreen() {
     var sunHour by remember { mutableStateOf(12f) }
     var showInclinometer by remember { mutableStateOf(false) }
     var isNorthLocked by remember { mutableStateOf(false) }
+    var showPeakFinderDialog by remember { mutableStateOf(false) }
     var showArCamera by remember { mutableStateOf(false) }
     var ultraBatteryEnabled by remember { mutableStateOf(false) }
     var showLiveShareDialog by remember { mutableStateOf(false) }
