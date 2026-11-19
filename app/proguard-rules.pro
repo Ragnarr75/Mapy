@@ -1,0 +1,1 @@
+# Regole base ProGuard
