@@ -164,7 +164,7 @@ object RoutingService {
         val existing = loadCachedPois(context).associateBy { it.id }.toMutableMap()
         newItems.forEach { existing[it.id] = it }
         val arr = JSONArray()
-        existing.values.takeLast(1500).forEach { poi ->
+        existing.values.toList().takeLast(1500).forEach { poi ->
             val obj = JSONObject()
             obj.put("id", poi.id)
             obj.put("name", poi.name)
