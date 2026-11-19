@@ -113,35 +113,23 @@ object GpxManager {
     }
 
     fun exportToGpxString(track: GpxTrack): String {
-        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
-            timeZone = TimeZone.getTimeZone("UTC")
-        }
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
         val sb = StringBuilder()
-        sb.append("<?xml version="1.0" encoding="UTF-8"?>
-")
-        sb.append("<gpx version="1.1" creator="MapyOutdoor" xmlns="http://www.topografix.com/GPX/1/1">
-")
-        sb.append("  <trk>
-")
-        sb.append("    <name>${track.name}</name>
-")
-        sb.append("    <trkseg>
-")
+        sb.appendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+        sb.appendLine("<gpx version=\"1.1\" creator=\"MapyOutdoor\" xmlns=\"http://www.topografix.com/GPX/1/1\">")
+        sb.appendLine("  <trk>")
+        sb.appendLine("    <name>${track.name}</name>")
+        sb.appendLine("    <trkseg>")
         for (pt in track.points) {
-            sb.append("      <trkpt lat="${pt.lat}" lon="${pt.lon}">
-")
-            sb.append("        <ele>${pt.ele}</ele>
-")
-            sb.append("        <time>${sdf.format(Date(pt.time))}</time>
-")
-            sb.append("      </trkpt>
-")
+            sb.appendLine("      <trkpt lat=\"${pt.lat}\" lon=\"${pt.lon}\">")
+            sb.appendLine("        <ele>${pt.ele}</ele>")
+            sb.appendLine("        <time>${sdf.format(Date(pt.time))}</time>")
+            sb.appendLine("      </trkpt>")
         }
-        sb.append("    </trkseg>
-")
-        sb.append("  </trk>
-")
-        sb.append("</gpx>")
+        sb.appendLine("    </trkseg>")
+        sb.appendLine("  </trk>")
+        sb.appendLine("</gpx>")
         return sb.toString()
     }
 
