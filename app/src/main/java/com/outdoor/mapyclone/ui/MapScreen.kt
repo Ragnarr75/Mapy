@@ -65,7 +65,6 @@ import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.RasterDemSource
-import org.maplibre.android.style.sources.Terrain
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
@@ -835,11 +834,7 @@ fun MapScreen() {
             val alt = baroAltitude?.toInt() ?: loc?.altitude?.toInt() ?: 0
             val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
             val bat = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            val sosMsg = "EMERGENZA SOCCORSO ALPINO
-Posizione WGS84: ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}
-Coordinate UTM: $utm
-Quota: ${alt}m slm
-Batteria telefono: $bat%"
+            val sosMsg = "EMERGENZA SOCCORSO ALPINO\nPosizione WGS84: ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}\nCoordinate UTM: $utm\nQuota: ${alt}m slm\nBatteria telefono: $bat%"
 
             AlertDialog(
                 onDismissRequest = { showSosConfirmDialog = false },
@@ -1294,19 +1289,28 @@ private fun getCleanStyleJson(type: MapLayerType): String {
 }
 
 private fun applyMapStyle(map: MapLibreMap, type: MapLayerType, enable3D: Boolean, sunHour: Float, onLoaded: () -> Unit) {
-    map.setStyle(Style.Builder().fromJson(getCleanStyleJson(type))) { style ->
+    var json = getCleanStyleJson(type)
+    if (enable3D) {
+        val demBlock = """
+            "terrain-dem": {
+              "type": "raster-dem",
+              "tiles": ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"],
+              "tileSize": 256,
+              "encoding": "terrarium"
+            },
+        """.trimIndent()
+        json = json.replace("\"sources\": {", "\"sources\": {\n$demBlock")
+        json = json.replace("}\n        }".trim(), "},\n          \"terrain\": { \"source\": \"terrain-dem\", \"exaggeration\": 1.45 }\n        }")
+        if (!json.contains("\"terrain\"")) {
+            json = json.substringBeforeLast("}") + ",\n  \"terrain\": { \"source\": \"terrain-dem\", \"exaggeration\": 1.45 }\n}"
+        }
+    }
+    map.setStyle(Style.Builder().fromJson(json)) { style ->
         if (enable3D) {
             try {
-                val demSource = RasterDemSource(
-                    "terrain-dem",
-                    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
-                    256
-                )
-                style.addSource(demSource)
-                style.setTerrain(Terrain("terrain-dem").withExaggeration(1.35f))
                 val sunAzimuth = ((sunHour - 6f) / 14f * 180f + 90f).coerceIn(0f, 360f)
                 val hillshade = HillshadeLayer("terrain-hillshade", "terrain-dem").withProperties(
-                    PropertyFactory.hillshadeExaggeration(0.55f),
+                    PropertyFactory.hillshadeExaggeration(0.50f),
                     PropertyFactory.hillshadeIlluminationDirection(sunAzimuth),
                     PropertyFactory.hillshadeShadowColor("#0D1B2A")
                 )
